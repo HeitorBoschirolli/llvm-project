@@ -120,19 +120,25 @@ void TargetLoweringBase::ArgListEntry::setAttributes(const CallBase *Call,
 /// result of type RetVT.
 std::pair<SDValue, SDValue>
 TargetLowering::makeLibCall(SelectionDAG &DAG, RTLIB::Libcall LC, EVT RetVT,
-                            ArrayRef<SDValue> Ops, bool isSigned,
-                            const SDLoc &dl, bool doesNotReturn,
-                            bool isReturnValueUsed,
-                            bool isPostTypeLegalization) const {
+                            ArrayRef<SDValue> Ops,
+                            MakeLibCallOptions CallOptions,
+                            const SDLoc &dl) const {
   TargetLowering::ArgListTy Args;
   Args.reserve(Ops.size());
 
   TargetLowering::ArgListEntry Entry;
-  for (SDValue Op : Ops) {
-    Entry.Node = Op;
+  for (unsigned i = 0; i < Ops.size(); ++i) {
+    SDValue NewOp = Ops[i];
+    Entry.Node = NewOp;
     Entry.Ty = Entry.Node.getValueType().getTypeForEVT(*DAG.getContext());
-    Entry.IsSExt = shouldSignExtendTypeInLibCall(Op.getValueType(), isSigned);
-    Entry.IsZExt = !shouldSignExtendTypeInLibCall(Op.getValueType(), isSigned);
+    Entry.IsSExt = shouldSignExtendTypeInLibCall(NewOp.getValueType(),
+                                                 CallOptions.IsSExt);
+    Entry.IsZExt = !Entry.IsSExt;
+
+    if (CallOptions.IsSoften &&
+        !shouldExtendTypeInLibCall(CallOptions.OpsVTBeforeSoften[i])) {
+      Entry.IsSExt = Entry.IsZExt = false;
+    }
     Args.push_back(Entry);
   }
 
@@ -143,15 +149,22 @@ TargetLowering::makeLibCall(SelectionDAG &DAG, RTLIB::Libcall LC, EVT RetVT,
 
   Type *RetTy = RetVT.getTypeForEVT(*DAG.getContext());
   TargetLowering::CallLoweringInfo CLI(DAG);
-  bool signExtend = shouldSignExtendTypeInLibCall(RetVT, isSigned);
+  bool signExtend = shouldSignExtendTypeInLibCall(RetVT, CallOptions.IsSExt);
+  bool zeroExtend = !signExtend;
+
+  if (CallOptions.IsSoften &&
+      !shouldExtendTypeInLibCall(CallOptions.RetVTBeforeSoften)) {
+    signExtend = zeroExtend = false;
+  }
+
   CLI.setDebugLoc(dl)
       .setChain(DAG.getEntryNode())
       .setLibCallee(getLibcallCallingConv(LC), RetTy, Callee, std::move(Args))
-      .setNoReturn(doesNotReturn)
-      .setDiscardResult(!isReturnValueUsed)
-      .setIsPostTypeLegalization(isPostTypeLegalization)
+      .setNoReturn(CallOptions.DoesNotReturn)
+      .setDiscardResult(!CallOptions.IsReturnValueUsed)
+      .setIsPostTypeLegalization(CallOptions.IsPostTypeLegalization)
       .setSExtResult(signExtend)
-      .setZExtResult(!signExtend);
+      .setZExtResult(zeroExtend);
   return LowerCallTo(CLI);
 }
 
@@ -262,7 +275,8 @@ TargetLowering::findOptimalMemOpLowering(std::vector<EVT> &MemOps,
 void TargetLowering::softenSetCCOperands(SelectionDAG &DAG, EVT VT,
                                          SDValue &NewLHS, SDValue &NewRHS,
                                          ISD::CondCode &CCCode,
-                                         const SDLoc &dl) const {
+                                         const SDLoc &dl, const SDValue OldLHS,
+                                         const SDValue OldRHS) const {
   assert((VT == MVT::f32 || VT == MVT::f64 || VT == MVT::f128 || VT == MVT::ppcf128)
          && "Unsupported setcc type!");
 
@@ -364,8 +378,11 @@ void TargetLowering::softenSetCCOperands(SelectionDAG &DAG, EVT VT,
   // Use the target specific return value for comparions lib calls.
   EVT RetVT = getCmpLibcallReturnType();
   SDValue Ops[2] = {NewLHS, NewRHS};
-  NewLHS = makeLibCall(DAG, LC1, RetVT, Ops, false /*sign irrelevant*/,
-                       dl).first;
+  TargetLowering::MakeLibCallOptions CallOptions;
+  EVT OpsVT[2] = { OldLHS.getValueType(),
+                   OldRHS.getValueType() };
+  CallOptions.setTypeListBeforeSoften(OpsVT, RetVT, true);
+  NewLHS = makeLibCall(DAG, LC1, RetVT, Ops, CallOptions, dl).first;
   NewRHS = DAG.getConstant(0, dl, RetVT);
 
   CCCode = getCmpLibcallCC(LC1);
@@ -377,8 +394,7 @@ void TargetLowering::softenSetCCOperands(SelectionDAG &DAG, EVT VT,
         ISD::SETCC, dl,
         getSetCCResultType(DAG.getDataLayout(), *DAG.getContext(), RetVT),
         NewLHS, NewRHS, DAG.getCondCode(CCCode));
-    NewLHS = makeLibCall(DAG, LC2, RetVT, Ops, false/*sign irrelevant*/,
-                         dl).first;
+    NewLHS = makeLibCall(DAG, LC2, RetVT, Ops, CallOptions, dl).first;
     NewLHS = DAG.getNode(
         ISD::SETCC, dl,
         getSetCCResultType(DAG.getDataLayout(), *DAG.getContext(), RetVT),
@@ -1820,9 +1836,7 @@ bool TargetLowering::SimplifyDemandedBits(
     // Bitcast from a vector using SimplifyDemanded Bits/VectorElts.
     // Demand the elt/bit if any of the original elts/bits are demanded.
     // TODO - bigendian once we have test coverage.
-    // TODO - bool vectors once SimplifyDemandedVectorElts has SETCC support.
-    if (SrcVT.isVector() && NumSrcEltBits > 1 &&
-        (BitWidth % NumSrcEltBits) == 0 &&
+    if (SrcVT.isVector() && (BitWidth % NumSrcEltBits) == 0 &&
         TLO.DAG.getDataLayout().isLittleEndian()) {
       unsigned Scale = BitWidth / NumSrcEltBits;
       unsigned NumSrcElts = SrcVT.getVectorNumElements();
@@ -1936,10 +1950,8 @@ bool TargetLowering::SimplifyDemandedBits(
     if (C && !C->isAllOnesValue() && !C->isOne() &&
         (C->getAPIntValue() | HighMask).isAllOnesValue()) {
       SDValue Neg1 = TLO.DAG.getAllOnesConstant(dl, VT);
-      // We can't guarantee that the new math op doesn't wrap, so explicitly
-      // clear those flags to prevent folding with a potential existing node
-      // that has those flags set.
-      SDNodeFlags Flags;
+      // Disable the nsw and nuw flags. We can no longer guarantee that we
+      // won't wrap after simplification.
       Flags.setNoSignedWrap(false);
       Flags.setNoUnsignedWrap(false);
       SDValue NewOp = TLO.DAG.getNode(Op.getOpcode(), dl, VT, Op0, Neg1, Flags);
@@ -2385,11 +2397,13 @@ bool TargetLowering::SimplifyDemandedVectorElts(
 
     // Update legal shuffle masks based on demanded elements if it won't reduce
     // to Identity which can cause premature removal of the shuffle mask.
-    if (Updated && !IdentityLHS && !IdentityRHS && !TLO.LegalOps &&
-        isShuffleMaskLegal(NewMask, VT))
-      return TLO.CombineTo(Op,
-                           TLO.DAG.getVectorShuffle(VT, DL, Op.getOperand(0),
-                                                    Op.getOperand(1), NewMask));
+    if (Updated && !IdentityLHS && !IdentityRHS && !TLO.LegalOps) {
+      SDValue LegalShuffle =
+          buildLegalVectorShuffle(VT, DL, Op.getOperand(0), Op.getOperand(1),
+                                  NewMask, TLO.DAG);
+      if (LegalShuffle)
+        return TLO.CombineTo(Op, LegalShuffle);
+    }
 
     // Propagate undef/zero elements from LHS/RHS.
     for (unsigned i = 0; i != NumElts; ++i) {
@@ -2625,6 +2639,23 @@ SDValue TargetLowering::SimplifyMultipleUseDemandedBitsForTargetNode(
       "Should use SimplifyMultipleUseDemandedBits if you don't know whether Op"
       " is a target node!");
   return SDValue();
+}
+
+SDValue
+TargetLowering::buildLegalVectorShuffle(EVT VT, const SDLoc &DL, SDValue N0,
+                                        SDValue N1, MutableArrayRef<int> Mask,
+                                        SelectionDAG &DAG) const {
+  bool LegalMask = isShuffleMaskLegal(Mask, VT);
+  if (!LegalMask) {
+    std::swap(N0, N1);
+    ShuffleVectorSDNode::commuteMask(Mask);
+    LegalMask = isShuffleMaskLegal(Mask, VT);
+  }
+
+  if (!LegalMask)
+    return SDValue();
+
+  return DAG.getVectorShuffle(VT, DL, N0, N1, Mask);
 }
 
 const Constant *TargetLowering::getTargetConstantFromLoad(LoadSDNode*) const {
@@ -5581,13 +5612,21 @@ bool TargetLowering::expandROT(SDNode *Node, SDValue &Result,
 
 bool TargetLowering::expandFP_TO_SINT(SDNode *Node, SDValue &Result,
                                       SelectionDAG &DAG) const {
-  SDValue Src = Node->getOperand(0);
+  unsigned OpNo = Node->isStrictFPOpcode() ? 1 : 0;
+  SDValue Src = Node->getOperand(OpNo);
   EVT SrcVT = Src.getValueType();
   EVT DstVT = Node->getValueType(0);
   SDLoc dl(SDValue(Node, 0));
 
   // FIXME: Only f32 to i64 conversions are supported.
   if (SrcVT != MVT::f32 || DstVT != MVT::i64)
+    return false;
+
+  if (Node->isStrictFPOpcode())
+    // When a NaN is converted to an integer a trap is allowed. We can't
+    // use this expansion here because it would eliminate that trap. Other
+    // traps are also allowed and cannot be eliminated. See 
+    // IEEE 754-2008 sec 5.8.
     return false;
 
   // Expand f32 -> i64 conversion
@@ -5643,9 +5682,11 @@ bool TargetLowering::expandFP_TO_SINT(SDNode *Node, SDValue &Result,
 }
 
 bool TargetLowering::expandFP_TO_UINT(SDNode *Node, SDValue &Result,
+                                      SDValue &Chain,
                                       SelectionDAG &DAG) const {
   SDLoc dl(SDValue(Node, 0));
-  SDValue Src = Node->getOperand(0);
+  unsigned OpNo = Node->isStrictFPOpcode() ? 1 : 0;
+  SDValue Src = Node->getOperand(OpNo);
 
   EVT SrcVT = Src.getValueType();
   EVT DstVT = Node->getValueType(0);
@@ -5653,7 +5694,9 @@ bool TargetLowering::expandFP_TO_UINT(SDNode *Node, SDValue &Result,
       getSetCCResultType(DAG.getDataLayout(), *DAG.getContext(), SrcVT);
 
   // Only expand vector types if we have the appropriate vector bit operations.
-  if (DstVT.isVector() && (!isOperationLegalOrCustom(ISD::FP_TO_SINT, DstVT) ||
+  unsigned SIntOpcode = Node->isStrictFPOpcode() ? ISD::STRICT_FP_TO_SINT : 
+                                                   ISD::FP_TO_SINT;
+  if (DstVT.isVector() && (!isOperationLegalOrCustom(SIntOpcode, DstVT) ||
                            !isOperationLegalOrCustomOrPromote(ISD::XOR, SrcVT)))
     return false;
 
@@ -5665,14 +5708,21 @@ bool TargetLowering::expandFP_TO_UINT(SDNode *Node, SDValue &Result,
   APInt SignMask = APInt::getSignMask(DstVT.getScalarSizeInBits());
   if (APFloat::opOverflow &
       APF.convertFromAPInt(SignMask, false, APFloat::rmNearestTiesToEven)) {
-    Result = DAG.getNode(ISD::FP_TO_SINT, dl, DstVT, Src);
+    if (Node->isStrictFPOpcode()) {
+      Result = DAG.getNode(ISD::STRICT_FP_TO_SINT, dl, { DstVT, MVT::Other }, 
+                           { Node->getOperand(0), Src }); 
+      Chain = Result.getValue(1);
+    } else
+      Result = DAG.getNode(ISD::FP_TO_SINT, dl, DstVT, Src);
     return true;
   }
 
   SDValue Cst = DAG.getConstantFP(APF, dl, SrcVT);
   SDValue Sel = DAG.getSetCC(dl, SetCCVT, Src, Cst, ISD::SETLT);
 
-  bool Strict = shouldUseStrictFP_TO_INT(SrcVT, DstVT, /*IsSigned*/ false);
+  bool Strict = Node->isStrictFPOpcode() ||
+                shouldUseStrictFP_TO_INT(SrcVT, DstVT, /*IsSigned*/ false);
+
   if (Strict) {
     // Expand based on maximum range of FP_TO_SINT, if the value exceeds the
     // signmask then offset (the result of which should be fully representable).
@@ -5682,12 +5732,23 @@ bool TargetLowering::expandFP_TO_UINT(SDNode *Node, SDValue &Result,
     // Result = fp_to_sint(Val) ^ Ofs
 
     // TODO: Should any fast-math-flags be set for the FSUB?
-    SDValue Val = DAG.getSelect(dl, SrcVT, Sel, Src,
-                                DAG.getNode(ISD::FSUB, dl, SrcVT, Src, Cst));
+    SDValue SrcBiased;
+    if (Node->isStrictFPOpcode())
+      SrcBiased = DAG.getNode(ISD::STRICT_FSUB, dl, { SrcVT, MVT::Other }, 
+                              { Node->getOperand(0), Src, Cst });
+    else
+      SrcBiased = DAG.getNode(ISD::FSUB, dl, SrcVT, Src, Cst);
+    SDValue Val = DAG.getSelect(dl, SrcVT, Sel, Src, SrcBiased);
     SDValue Ofs = DAG.getSelect(dl, DstVT, Sel, DAG.getConstant(0, dl, DstVT),
                                 DAG.getConstant(SignMask, dl, DstVT));
-    Result = DAG.getNode(ISD::XOR, dl, DstVT,
-                         DAG.getNode(ISD::FP_TO_SINT, dl, DstVT, Val), Ofs);
+    SDValue SInt;
+    if (Node->isStrictFPOpcode()) {
+      SInt = DAG.getNode(ISD::STRICT_FP_TO_SINT, dl, { DstVT, MVT::Other }, 
+                         { SrcBiased.getValue(1), Val });
+      Chain = SInt.getValue(1);
+    } else
+      SInt = DAG.getNode(ISD::FP_TO_SINT, dl, DstVT, Val);
+    Result = DAG.getNode(ISD::XOR, dl, DstVT, SInt, Ofs);
   } else {
     // Expand based on maximum range of FP_TO_SINT:
     // True = fp_to_sint(Src)
@@ -6637,7 +6698,8 @@ SDValue
 TargetLowering::expandFixedPointMul(SDNode *Node, SelectionDAG &DAG) const {
   assert((Node->getOpcode() == ISD::SMULFIX ||
           Node->getOpcode() == ISD::UMULFIX ||
-          Node->getOpcode() == ISD::SMULFIXSAT) &&
+          Node->getOpcode() == ISD::SMULFIXSAT ||
+          Node->getOpcode() == ISD::UMULFIXSAT) &&
          "Expected a fixed point multiplication opcode");
 
   SDLoc dl(Node);
@@ -6645,15 +6707,19 @@ TargetLowering::expandFixedPointMul(SDNode *Node, SelectionDAG &DAG) const {
   SDValue RHS = Node->getOperand(1);
   EVT VT = LHS.getValueType();
   unsigned Scale = Node->getConstantOperandVal(2);
-  bool Saturating = Node->getOpcode() == ISD::SMULFIXSAT;
+  bool Saturating = (Node->getOpcode() == ISD::SMULFIXSAT ||
+                     Node->getOpcode() == ISD::UMULFIXSAT);
+  bool Signed = (Node->getOpcode() == ISD::SMULFIX ||
+                 Node->getOpcode() == ISD::SMULFIXSAT);
   EVT BoolVT = getSetCCResultType(DAG.getDataLayout(), *DAG.getContext(), VT);
   unsigned VTSize = VT.getScalarSizeInBits();
 
   if (!Scale) {
     // [us]mul.fix(a, b, 0) -> mul(a, b)
-    if (!Saturating && isOperationLegalOrCustom(ISD::MUL, VT)) {
-      return DAG.getNode(ISD::MUL, dl, VT, LHS, RHS);
-    } else if (Saturating && isOperationLegalOrCustom(ISD::SMULO, VT)) {
+    if (!Saturating) {
+      if (isOperationLegalOrCustom(ISD::MUL, VT))
+        return DAG.getNode(ISD::MUL, dl, VT, LHS, RHS);
+    } else if (Signed && isOperationLegalOrCustom(ISD::SMULO, VT)) {
       SDValue Result =
           DAG.getNode(ISD::SMULO, dl, DAG.getVTList(VT, BoolVT), LHS, RHS);
       SDValue Product = Result.getValue(0);
@@ -6667,11 +6733,18 @@ TargetLowering::expandFixedPointMul(SDNode *Node, SelectionDAG &DAG) const {
       SDValue ProdNeg = DAG.getSetCC(dl, BoolVT, Product, Zero, ISD::SETLT);
       Result = DAG.getSelect(dl, VT, ProdNeg, SatMax, SatMin);
       return DAG.getSelect(dl, VT, Overflow, Result, Product);
+    } else if (!Signed && isOperationLegalOrCustom(ISD::UMULO, VT)) {
+      SDValue Result =
+          DAG.getNode(ISD::UMULO, dl, DAG.getVTList(VT, BoolVT), LHS, RHS);
+      SDValue Product = Result.getValue(0);
+      SDValue Overflow = Result.getValue(1);
+
+      APInt MaxVal = APInt::getMaxValue(VTSize);
+      SDValue SatMax = DAG.getConstant(MaxVal, dl, VT);
+      return DAG.getSelect(dl, VT, Overflow, SatMax, Product);
     }
   }
 
-  bool Signed =
-      Node->getOpcode() == ISD::SMULFIX || Node->getOpcode() == ISD::SMULFIXSAT;
   assert(((Signed && Scale < VTSize) || (!Signed && Scale <= VTSize)) &&
          "Expected scale to be less than the number of bits if signed or at "
          "most the number of bits if unsigned.");
@@ -6697,7 +6770,8 @@ TargetLowering::expandFixedPointMul(SDNode *Node, SelectionDAG &DAG) const {
 
   if (Scale == VTSize)
     // Result is just the top half since we'd be shifting by the width of the
-    // operand.
+    // operand. Overflow impossible so this works for both UMULFIX and
+    // UMULFIXSAT.
     return Hi;
 
   // The result will need to be shifted right by the scale since both operands
@@ -6709,20 +6783,55 @@ TargetLowering::expandFixedPointMul(SDNode *Node, SelectionDAG &DAG) const {
   if (!Saturating)
     return Result;
 
-  unsigned OverflowBits = VTSize - Scale + 1; // +1 for the sign
-  SDValue HiMask =
-      DAG.getConstant(APInt::getHighBitsSet(VTSize, OverflowBits), dl, VT);
-  SDValue LoMask = DAG.getConstant(
-      APInt::getLowBitsSet(VTSize, VTSize - OverflowBits), dl, VT);
-  APInt MaxVal = APInt::getSignedMaxValue(VTSize);
-  APInt MinVal = APInt::getSignedMinValue(VTSize);
+  if (!Signed) {
+    // Unsigned overflow happened if the upper (VTSize - Scale) bits (of the
+    // widened multiplication) aren't all zeroes.
 
-  Result = DAG.getSelectCC(dl, Hi, LoMask,
-                           DAG.getConstant(MaxVal, dl, VT), Result,
-                           ISD::SETGT);
-  return DAG.getSelectCC(dl, Hi, HiMask,
-                         DAG.getConstant(MinVal, dl, VT), Result,
-                         ISD::SETLT);
+    // Saturate to max if ((Hi >> Scale) != 0),
+    // which is the same as if (Hi > ((1 << Scale) - 1))
+    APInt MaxVal = APInt::getMaxValue(VTSize);
+    SDValue LowMask = DAG.getConstant(APInt::getLowBitsSet(VTSize, Scale),
+                                      dl, VT);
+    Result = DAG.getSelectCC(dl, Hi, LowMask,
+                             DAG.getConstant(MaxVal, dl, VT), Result,
+                             ISD::SETUGT);
+
+    return Result;
+  }
+
+  // Signed overflow happened if the upper (VTSize - Scale + 1) bits (of the
+  // widened multiplication) aren't all ones or all zeroes.
+
+  SDValue SatMin = DAG.getConstant(APInt::getSignedMinValue(VTSize), dl, VT);
+  SDValue SatMax = DAG.getConstant(APInt::getSignedMaxValue(VTSize), dl, VT);
+
+  if (Scale == 0) {
+    SDValue Sign = DAG.getNode(ISD::SRA, dl, VT, Lo,
+                               DAG.getConstant(VTSize - 1, dl, ShiftTy));
+    SDValue Overflow = DAG.getSetCC(dl, BoolVT, Hi, Sign, ISD::SETNE);
+    // Saturated to SatMin if wide product is negative, and SatMax if wide
+    // product is positive ...
+    SDValue Zero = DAG.getConstant(0, dl, VT);
+    SDValue ResultIfOverflow = DAG.getSelectCC(dl, Hi, Zero, SatMin, SatMax,
+                                               ISD::SETLT);
+    // ... but only if we overflowed.
+    return DAG.getSelect(dl, VT, Overflow, ResultIfOverflow, Result);
+  }
+
+  //  We handled Scale==0 above so all the bits to examine is in Hi.
+
+  // Saturate to max if ((Hi >> (Scale - 1)) > 0),
+  // which is the same as if (Hi > (1 << (Scale - 1)) - 1)
+  SDValue LowMask = DAG.getConstant(APInt::getLowBitsSet(VTSize, Scale - 1),
+                                    dl, VT);
+  Result = DAG.getSelectCC(dl, Hi, LowMask, SatMax, Result, ISD::SETGT);
+  // Saturate to min if (Hi >> (Scale - 1)) < -1),
+  // which is the same as if (HI < (-1 << (Scale - 1))
+  SDValue HighMask =
+      DAG.getConstant(APInt::getHighBitsSet(VTSize, VTSize - Scale + 1),
+                      dl, VT);
+  Result = DAG.getSelectCC(dl, Hi, HighMask, SatMin, Result, ISD::SETLT);
+  return Result;
 }
 
 void TargetLowering::expandUADDSUBO(
@@ -6895,20 +7004,19 @@ bool TargetLowering::expandMULO(SDNode *Node, SDValue &Result,
     // being a legal type for the architecture and thus has to be split to
     // two arguments.
     SDValue Ret;
+    TargetLowering::MakeLibCallOptions CallOptions;
+    CallOptions.setSExt(isSigned);
+    CallOptions.setIsPostTypeLegalization(true);
     if (shouldSplitFunctionArgumentsAsLittleEndian(DAG.getDataLayout())) {
       // Halves of WideVT are packed into registers in different order
       // depending on platform endianness. This is usually handled by
       // the C calling convention, but we can't defer to it in
       // the legalizer.
       SDValue Args[] = { LHS, HiLHS, RHS, HiRHS };
-      Ret = makeLibCall(DAG, LC, WideVT, Args, isSigned, dl,
-          /* doesNotReturn */ false, /* isReturnValueUsed */ true,
-          /* isPostTypeLegalization */ true).first;
+      Ret = makeLibCall(DAG, LC, WideVT, Args, CallOptions, dl).first;
     } else {
       SDValue Args[] = { HiLHS, LHS, HiRHS, RHS };
-      Ret = makeLibCall(DAG, LC, WideVT, Args, isSigned, dl,
-          /* doesNotReturn */ false, /* isReturnValueUsed */ true,
-          /* isPostTypeLegalization */ true).first;
+      Ret = makeLibCall(DAG, LC, WideVT, Args, CallOptions, dl).first;
     }
     assert(Ret.getOpcode() == ISD::MERGE_VALUES &&
            "Ret value is a collection of constituent nodes holding result.");

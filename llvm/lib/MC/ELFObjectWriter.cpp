@@ -511,6 +511,19 @@ static uint8_t mergeTypeForSet(uint8_t origType, uint8_t newType) {
   return Type;
 }
 
+static bool isIFunc(const MCSymbolELF *Symbol) {
+  while (Symbol->getType() != ELF::STT_GNU_IFUNC) {
+    const MCSymbolRefExpr *Value;
+    if (!Symbol->isVariable() ||
+        !(Value = dyn_cast<MCSymbolRefExpr>(Symbol->getVariableValue())) ||
+        Value->getKind() != MCSymbolRefExpr::VK_None ||
+        mergeTypeForSet(Symbol->getType(), ELF::STT_GNU_IFUNC) != ELF::STT_GNU_IFUNC)
+      return false;
+    Symbol = &cast<MCSymbolELF>(Value->getSymbol());
+  }
+  return true;
+}
+
 void ELFWriter::writeSymbol(SymbolTableWriter &Writer, uint32_t StringIndex,
                             ELFSymbolData &MSD, const MCAsmLayout &Layout) {
   const auto &Symbol = cast<MCSymbolELF>(*MSD.Symbol);
@@ -524,6 +537,8 @@ void ELFWriter::writeSymbol(SymbolTableWriter &Writer, uint32_t StringIndex,
   // Binding and Type share the same byte as upper and lower nibbles
   uint8_t Binding = Symbol.getBinding();
   uint8_t Type = Symbol.getType();
+  if (isIFunc(&Symbol))
+    Type = ELF::STT_GNU_IFUNC;
   if (Base) {
     Type = mergeTypeForSet(Type, Base->getType());
   }
@@ -1285,21 +1300,8 @@ void ELFObjectWriter::executePostLayoutBinding(MCAssembler &Asm,
     Alias->setBinding(Symbol.getBinding());
     Alias->setOther(Symbol.getOther());
 
-    // Record the rename. This serves two purposes: 1) detect multiple symbol
-    // version definitions, 2) consistently suppress the original symbol in the
-    // symbol table. GNU as keeps the original symbol for defined @ and @@, but
-    // suppresses in for other cases (@@@ or undefined). The original symbol is
-    // usually undesired and difficult to remove in an archive. Moreoever, it
-    // can cause linker issues like binutils PR/18703. If the user wants other
-    // aliases to the versioned symbol, they can copy the original symbol to
-    // other symbol names with .set directive.
-    auto R = Renames.try_emplace(&Symbol, Alias);
-    if (!R.second && R.first->second != Alias) {
-      Asm.getContext().reportError(
-          SMLoc(), llvm::Twine("multiple symbol versions defined for ") +
-                       Symbol.getName());
+    if (!Symbol.isUndefined() && !Rest.startswith("@@@"))
       continue;
-    }
 
     // FIXME: Get source locations for these errors or diagnose them earlier.
     if (Symbol.isUndefined() && Rest.startswith("@@") &&
@@ -1308,6 +1310,15 @@ void ELFObjectWriter::executePostLayoutBinding(MCAssembler &Asm,
                                                 " must be defined");
       continue;
     }
+
+    if (Renames.count(&Symbol) && Renames[&Symbol] != Alias) {
+      Asm.getContext().reportError(
+          SMLoc(), llvm::Twine("multiple symbol versions defined for ") +
+                       Symbol.getName());
+      continue;
+    }
+
+    Renames.insert(std::make_pair(&Symbol, Alias));
   }
 
   for (const MCSymbol *&Sym : AddrsigSyms) {

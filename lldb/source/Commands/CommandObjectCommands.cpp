@@ -85,9 +85,7 @@ protected:
         m_clear.SetOptionWasSet();
         break;
       default:
-        error.SetErrorStringWithFormat("unrecognized option '%c'",
-                                       short_option);
-        break;
+        llvm_unreachable("Unimplemented option");
       }
 
       return error;
@@ -215,13 +213,12 @@ public:
     return "";
   }
 
-  int HandleArgumentCompletion(
-      CompletionRequest &request,
-      OptionElementVector &opt_element_vector) override {
+  void
+  HandleArgumentCompletion(CompletionRequest &request,
+                           OptionElementVector &opt_element_vector) override {
     CommandCompletions::InvokeCommonCompletionCallbacks(
         GetCommandInterpreter(), CommandCompletions::eDiskFileCompletion,
         request, nullptr);
-    return request.GetNumberOfMatches();
   }
 
   Options *GetOptions() override { return &m_options; }
@@ -254,9 +251,7 @@ protected:
         break;
 
       default:
-        error.SetErrorStringWithFormat("unrecognized option '%c'",
-                                       short_option);
-        break;
+        llvm_unreachable("Unimplemented option");
       }
 
       return error;
@@ -371,9 +366,7 @@ protected:
         break;
 
       default:
-        error.SetErrorStringWithFormat("invalid short option character '%c'",
-                                       short_option);
-        break;
+        llvm_unreachable("Unimplemented option");
       }
 
       return error;
@@ -866,6 +859,7 @@ protected:
                                    "defined regular expression command names",
                                    GetCommandName().str().c_str());
       result.SetStatus(eReturnStatusFailed);
+      return false;
     }
 
     auto command_name = args[0].ref;
@@ -1162,9 +1156,7 @@ private:
         m_syntax.assign(option_arg);
         break;
       default:
-        error.SetErrorStringWithFormat("unrecognized option '%c'",
-                                       short_option);
-        break;
+        llvm_unreachable("Unimplemented option");
       }
 
       return error;
@@ -1388,13 +1380,12 @@ public:
 
   ~CommandObjectCommandsScriptImport() override = default;
 
-  int HandleArgumentCompletion(
-      CompletionRequest &request,
-      OptionElementVector &opt_element_vector) override {
+  void
+  HandleArgumentCompletion(CompletionRequest &request,
+                           OptionElementVector &opt_element_vector) override {
     CommandCompletions::InvokeCommonCompletionCallbacks(
         GetCommandInterpreter(), CommandCompletions::eDiskFileCompletion,
         request, nullptr);
-    return request.GetNumberOfMatches();
   }
 
   Options *GetOptions() override { return &m_options; }
@@ -1416,9 +1407,7 @@ protected:
         m_allow_reload = true;
         break;
       default:
-        error.SetErrorStringWithFormat("unrecognized option '%c'",
-                                       short_option);
-        break;
+        llvm_unreachable("Unimplemented option");
       }
 
       return error;
@@ -1570,9 +1559,7 @@ protected:
               option_arg.str().c_str());
         break;
       default:
-        error.SetErrorStringWithFormat("unrecognized option '%c'",
-                                       short_option);
-        break;
+        llvm_unreachable("Unimplemented option");
       }
 
       return error;
@@ -1738,6 +1725,12 @@ public:
   ~CommandObjectCommandsScriptList() override = default;
 
   bool DoExecute(Args &command, CommandReturnObject &result) override {
+    if (command.GetArgumentCount() != 0) {
+      result.AppendError("'command script list' doesn't take any arguments");
+      result.SetStatus(eReturnStatusFailed);
+      return false;
+    }
+
     m_interpreter.GetHelp(result, CommandInterpreter::eCommandTypesUserDef);
 
     result.SetStatus(eReturnStatusSuccessFinishResult);
@@ -1758,6 +1751,12 @@ public:
 
 protected:
   bool DoExecute(Args &command, CommandReturnObject &result) override {
+    if (command.GetArgumentCount() != 0) {
+      result.AppendError("'command script clear' doesn't take any arguments");
+      result.SetStatus(eReturnStatusFailed);
+      return false;
+    }
+
     m_interpreter.RemoveAllUser();
 
     result.SetStatus(eReturnStatusSuccessFinishResult);

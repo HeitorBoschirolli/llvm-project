@@ -794,6 +794,9 @@ ASTDeclReader::VisitRecordDeclImpl(RecordDecl *RD) {
   RD->setNonTrivialToPrimitiveDefaultInitialize(Record.readInt());
   RD->setNonTrivialToPrimitiveCopy(Record.readInt());
   RD->setNonTrivialToPrimitiveDestroy(Record.readInt());
+  RD->setHasNonTrivialToPrimitiveDefaultInitializeCUnion(Record.readInt());
+  RD->setHasNonTrivialToPrimitiveDestructCUnion(Record.readInt());
+  RD->setHasNonTrivialToPrimitiveCopyCUnion(Record.readInt());
   RD->setParamDestroyedInCallee(Record.readInt());
   RD->setArgPassingRestrictions((RecordDecl::ArgPassingKind)Record.readInt());
   return Redecl;
@@ -4571,12 +4574,15 @@ void ASTDeclReader::UpdateDecl(Decl *D,
       break;
     }
 
-    case UPD_DECL_MARKED_OPENMP_DECLARETARGET:
+    case UPD_DECL_MARKED_OPENMP_DECLARETARGET: {
+      OMPDeclareTargetDeclAttr::MapTypeTy MapType =
+          static_cast<OMPDeclareTargetDeclAttr::MapTypeTy>(Record.readInt());
+      OMPDeclareTargetDeclAttr::DevTypeTy DevType =
+          static_cast<OMPDeclareTargetDeclAttr::DevTypeTy>(Record.readInt());
       D->addAttr(OMPDeclareTargetDeclAttr::CreateImplicit(
-          Reader.getContext(),
-          static_cast<OMPDeclareTargetDeclAttr::MapTypeTy>(Record.readInt()),
-          ReadSourceRange()));
+          Reader.getContext(), MapType, DevType, ReadSourceRange()));
       break;
+    }
 
     case UPD_ADDED_ATTR_TO_RECORD:
       AttrVec Attrs;

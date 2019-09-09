@@ -502,9 +502,7 @@ if (MSVC)
       # Disabled warnings.
       -wd4141 # Suppress ''modifier' : used more than once' (because of __forceinline combined with inline)
       -wd4146 # Suppress 'unary minus operator applied to unsigned type, result still unsigned'
-      -wd4180 # Suppress 'qualifier applied to function type has no meaning; ignored'
       -wd4244 # Suppress ''argument' : conversion from 'type1' to 'type2', possible loss of data'
-      -wd4258 # Suppress ''var' : definition from the for loop is ignored; the definition from the enclosing scope is used'
       -wd4267 # Suppress ''var' : conversion from 'size_t' to 'type', possible loss of data'
       -wd4291 # Suppress ''declaration' : no matching operator delete found; memory will not be freed if initialization throws an exception'
       -wd4345 # Suppress 'behavior change: an object of POD type constructed with an initializer of the form () will be default-initialized'
@@ -523,7 +521,7 @@ if (MSVC)
       -wd4610 # Suppress '<class> can never be instantiated'
       -wd4510 # Suppress 'default constructor could not be generated'
       -wd4702 # Suppress 'unreachable code'
-      -wd4245 # Suppress 'signed/unsigned mismatch'
+      -wd4245 # Suppress ''conversion' : conversion from 'type1' to 'type2', signed/unsigned mismatch'
       -wd4706 # Suppress 'assignment within conditional expression'
       -wd4310 # Suppress 'cast truncates constant value'
       -wd4701 # Suppress 'potentially uninitialized local variable'
@@ -543,12 +541,10 @@ if (MSVC)
           # is fixed.
       -wd4709 # Suppress comma operator within array index expression
 
-      # Ideally, we'd like this warning to be enabled, but MSVC 2013 doesn't
+      # Ideally, we'd like this warning to be enabled, but even MSVC 2019 doesn't
       # support the 'aligned' attribute in the way that clang sources requires (for
       # any code that uses the LLVM_ALIGNAS macro), so this is must be disabled to
       # avoid unwanted alignment warnings.
-      # When we switch to requiring a version of MSVC that supports the 'alignas'
-      # specifier (MSVC 2015?) this warning can be re-enabled.
       -wd4324 # Suppress 'structure was padded due to __declspec(align())'
 
       # Promoted warnings.

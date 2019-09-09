@@ -171,6 +171,12 @@ def G_BSWAP : GenericInstruction {
   let hasSideEffects = 0;
 }
 
+def G_BITREVERSE : GenericInstruction {
+  let OutOperandList = (outs type0:$dst);
+  let InOperandList = (ins type0:$src);
+  let hasSideEffects = 0;
+}
+
 def G_ADDRSPACE_CAST : GenericInstruction {
   let OutOperandList = (outs type0:$dst);
   let InOperandList = (ins type1:$src);
@@ -187,6 +193,12 @@ def G_JUMP_TABLE : GenericInstruction {
   let OutOperandList = (outs type0:$dst);
   let InOperandList = (ins unknown:$jti);
   let hasSideEffects = 0;
+}
+
+def G_DYN_STACKALLOC : GenericInstruction {
+  let OutOperandList = (outs ptype0:$dst);
+  let InOperandList = (ins type1:$size, i32imm:$align);
+  let hasSideEffects = 1;
 }
 
 //------------------------------------------------------------------------------
@@ -606,6 +618,15 @@ def G_FMUL : GenericInstruction {
 // Generic fused multiply-add instruction.
 // Behaves like llvm fma intrinsic ie src1 * src2 + src3
 def G_FMA : GenericInstruction {
+  let OutOperandList = (outs type0:$dst);
+  let InOperandList = (ins type0:$src1, type0:$src2, type0:$src3);
+  let hasSideEffects = 0;
+  let isCommutable = 0;
+}
+
+/// Generic FP multiply and add. Perform a * b + c, while getting the
+/// same result as the separately rounded operations, unlike G_FMA.
+def G_FMAD : GenericInstruction {
   let OutOperandList = (outs type0:$dst);
   let InOperandList = (ins type0:$src1, type0:$src2, type0:$src3);
   let hasSideEffects = 0;

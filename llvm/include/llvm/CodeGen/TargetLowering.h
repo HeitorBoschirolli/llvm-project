@@ -923,6 +923,7 @@ public:
     case ISD::SMULFIX:
     case ISD::SMULFIXSAT:
     case ISD::UMULFIX:
+    case ISD::UMULFIXSAT:
       Supported = isSupportedFixedPointOperation(Op, VT, Scale);
       break;
     }
@@ -960,6 +961,8 @@ public:
       case ISD::STRICT_FFLOOR: EqOpc = ISD::FFLOOR; break;
       case ISD::STRICT_FROUND: EqOpc = ISD::FROUND; break;
       case ISD::STRICT_FTRUNC: EqOpc = ISD::FTRUNC; break;
+      case ISD::STRICT_FP_TO_SINT: EqOpc = ISD::FP_TO_SINT; break;
+      case ISD::STRICT_FP_TO_UINT: EqOpc = ISD::FP_TO_UINT; break;
       case ISD::STRICT_FP_ROUND: EqOpc = ISD::FP_ROUND; break;
       case ISD::STRICT_FP_EXTEND: EqOpc = ISD::FP_EXTEND; break;
     }
@@ -1574,36 +1577,24 @@ public:
     report_fatal_error("Funclet EH is not implemented for this target");
   }
 
-  /// Returns the target's jmp_buf size in bytes (if never set, the default is
-  /// 200)
-  unsigned getJumpBufSize() const {
-    return JumpBufSize;
-  }
-
-  /// Returns the target's jmp_buf alignment in bytes (if never set, the default
-  /// is 0)
-  unsigned getJumpBufAlignment() const {
-    return JumpBufAlignment;
-  }
-
   /// Return the minimum stack alignment of an argument.
   unsigned getMinStackArgumentAlignment() const {
-    return MinStackArgumentAlignment;
+    return MinStackArgumentAlignment.value();
   }
 
   /// Return the minimum function alignment.
-  unsigned getMinFunctionAlignment() const {
-    return MinFunctionAlignment;
+  unsigned getMinFunctionLogAlignment() const {
+    return Log2(MinFunctionAlignment);
   }
 
   /// Return the preferred function alignment.
-  unsigned getPrefFunctionAlignment() const {
-    return PrefFunctionAlignment;
+  unsigned getPrefFunctionLogAlignment() const {
+    return Log2(PrefFunctionAlignment);
   }
 
   /// Return the preferred loop alignment.
-  virtual unsigned getPrefLoopAlignment(MachineLoop *ML = nullptr) const {
-    return PrefLoopAlignment;
+  virtual unsigned getPrefLoopLogAlignment(MachineLoop *ML = nullptr) const {
+    return Log2(PrefLoopAlignment);
   }
 
   /// Should loops be aligned even when the function is marked OptSize (but not
@@ -1822,6 +1813,11 @@ public:
   /// Returns true if arguments should be sign-extended in lib calls.
   virtual bool shouldSignExtendTypeInLibCall(EVT Type, bool IsSigned) const {
     return IsSigned;
+  }
+
+  /// Returns true if arguments should be extended in lib calls.
+  virtual bool shouldExtendTypeInLibCall(EVT Type) const {
+    return true;
   }
 
   /// Returns how the given (atomic) load should be expanded by the
@@ -2109,40 +2105,25 @@ protected:
     TargetDAGCombineArray[NT >> 3] |= 1 << (NT&7);
   }
 
-  /// Set the target's required jmp_buf buffer size (in bytes); default is 200
-  void setJumpBufSize(unsigned Size) {
-    JumpBufSize = Size;
-  }
-
-  /// Set the target's required jmp_buf buffer alignment (in bytes); default is
-  /// 0
-  void setJumpBufAlignment(unsigned Align) {
-    JumpBufAlignment = Align;
-  }
-
-  /// Set the target's minimum function alignment (in log2(bytes))
-  void setMinFunctionAlignment(unsigned Align) {
+  /// Set the target's minimum function alignment.
+  void setMinFunctionAlignment(llvm::Align Align) {
     MinFunctionAlignment = Align;
   }
 
   /// Set the target's preferred function alignment.  This should be set if
-  /// there is a performance benefit to higher-than-minimum alignment (in
-  /// log2(bytes))
-  void setPrefFunctionAlignment(unsigned Align) {
+  /// there is a performance benefit to higher-than-minimum alignment
+  void setPrefFunctionAlignment(llvm::Align Align) {
     PrefFunctionAlignment = Align;
   }
 
-  /// Set the target's preferred loop alignment. Default alignment is zero, it
-  /// means the target does not care about loop alignment.  The alignment is
-  /// specified in log2(bytes). The target may also override
-  /// getPrefLoopAlignment to provide per-loop values.
-  void setPrefLoopAlignment(unsigned Align) {
-    PrefLoopAlignment = Align;
-  }
+  /// Set the target's preferred loop alignment. Default alignment is one, it
+  /// means the target does not care about loop alignment. The target may also
+  /// override getPrefLoopAlignment to provide per-loop values.
+  void setPrefLoopAlignment(llvm::Align Align) { PrefLoopAlignment = Align; }
 
-  /// Set the minimum stack alignment of an argument (in log2(bytes)).
+  /// Set the minimum stack alignment of an argument.
   void setMinStackArgumentAlignment(unsigned Align) {
-    MinStackArgumentAlignment = Align;
+    MinStackArgumentAlignment = llvm::Align(Align);
   }
 
   /// Set the maximum atomic operation size supported by the
@@ -2703,25 +2684,19 @@ private:
   /// register usage.
   Sched::Preference SchedPreferenceInfo;
 
-  /// The size, in bytes, of the target's jmp_buf buffers
-  unsigned JumpBufSize;
-
-  /// The alignment, in bytes, of the target's jmp_buf buffers
-  unsigned JumpBufAlignment;
-
   /// The minimum alignment that any argument on the stack needs to have.
-  unsigned MinStackArgumentAlignment;
+  llvm::Align MinStackArgumentAlignment;
 
   /// The minimum function alignment (used when optimizing for size, and to
   /// prevent explicitly provided alignment from leading to incorrect code).
-  unsigned MinFunctionAlignment;
+  llvm::Align MinFunctionAlignment;
 
   /// The preferred function alignment (used when alignment unspecified and
   /// optimizing for speed).
-  unsigned PrefFunctionAlignment;
+  llvm::Align PrefFunctionAlignment;
 
-  /// The preferred loop alignment.
-  unsigned PrefLoopAlignment;
+  /// The preferred loop alignment (in log2 bot in bytes).
+  llvm::Align PrefLoopAlignment;
 
   /// Size in bits of the maximum atomics size the backend supports.
   /// Accesses larger than this will be expanded by AtomicExpandPass.
@@ -2943,6 +2918,7 @@ protected:
 class TargetLowering : public TargetLoweringBase {
 public:
   struct DAGCombinerInfo;
+  struct MakeLibCallOptions;
 
   TargetLowering(const TargetLowering &) = delete;
   TargetLowering &operator=(const TargetLowering &) = delete;
@@ -3013,14 +2989,15 @@ public:
 
   void softenSetCCOperands(SelectionDAG &DAG, EVT VT, SDValue &NewLHS,
                            SDValue &NewRHS, ISD::CondCode &CCCode,
-                           const SDLoc &DL) const;
+                           const SDLoc &DL, const SDValue OldLHS,
+                           const SDValue OldRHS) const;
 
   /// Returns a pair of (return value, chain).
   /// It is an error to pass RTLIB::UNKNOWN_LIBCALL as \p LC.
-  std::pair<SDValue, SDValue> makeLibCall(
-      SelectionDAG &DAG, RTLIB::Libcall LC, EVT RetVT, ArrayRef<SDValue> Ops,
-      bool isSigned, const SDLoc &dl, bool doesNotReturn = false,
-      bool isReturnValueUsed = true, bool isPostTypeLegalization = false) const;
+  std::pair<SDValue, SDValue> makeLibCall(SelectionDAG &DAG, RTLIB::Libcall LC,
+                                          EVT RetVT, ArrayRef<SDValue> Ops,
+                                          MakeLibCallOptions CallOptions,
+                                          const SDLoc &dl) const;
 
   /// Check whether parameters to a call that are passed in callee saved
   /// registers are the same as from the calling function.  This needs to be
@@ -3219,6 +3196,14 @@ public:
   virtual SDValue SimplifyMultipleUseDemandedBitsForTargetNode(
       SDValue Op, const APInt &DemandedBits, const APInt &DemandedElts,
       SelectionDAG &DAG, unsigned Depth) const;
+
+  /// Tries to build a legal vector shuffle using the provided parameters
+  /// or equivalent variations. The Mask argument maybe be modified as the
+  /// function tries different variations.
+  /// Returns an empty SDValue if the operation fails.
+  SDValue buildLegalVectorShuffle(EVT VT, const SDLoc &DL, SDValue N0,
+                                  SDValue N1, MutableArrayRef<int> Mask,
+                                  SelectionDAG &DAG) const;
 
   /// This method returns the constant pool value that will be loaded by LD.
   /// NOTE: You must check for implicit extensions of the constant by LD.
@@ -3546,6 +3531,51 @@ public:
 
     ArgListTy &getArgs() {
       return Args;
+    }
+  };
+
+  /// This structure is used to pass arguments to makeLibCall function.
+  struct MakeLibCallOptions {
+    // By passing type list before soften to makeLibCall, the target hook
+    // shouldExtendTypeInLibCall can get the original type before soften.
+    ArrayRef<EVT> OpsVTBeforeSoften;
+    EVT RetVTBeforeSoften;
+    bool IsSExt : 1;
+    bool DoesNotReturn : 1;
+    bool IsReturnValueUsed : 1;
+    bool IsPostTypeLegalization : 1;
+    bool IsSoften : 1;
+
+    MakeLibCallOptions()
+        : IsSExt(false), DoesNotReturn(false), IsReturnValueUsed(true),
+          IsPostTypeLegalization(false), IsSoften(false) {}
+
+    MakeLibCallOptions &setSExt(bool Value = true) {
+      IsSExt = Value;
+      return *this;
+    }
+
+    MakeLibCallOptions &setNoReturn(bool Value = true) {
+      DoesNotReturn = Value;
+      return *this;
+    }
+
+    MakeLibCallOptions &setDiscardResult(bool Value = true) {
+      IsReturnValueUsed = !Value;
+      return *this;
+    }
+
+    MakeLibCallOptions &setIsPostTypeLegalization(bool Value = true) {
+      IsPostTypeLegalization = Value;
+      return *this;
+    }
+
+    MakeLibCallOptions &setTypeListBeforeSoften(ArrayRef<EVT> OpsVT, EVT RetVT,
+                                                bool Value = true) {
+      OpsVTBeforeSoften = OpsVT;
+      RetVTBeforeSoften = RetVT;
+      IsSoften = Value;
+      return *this;
     }
   };
 
@@ -3987,7 +4017,7 @@ public:
   /// \param N Node to expand
   /// \param Result output after conversion
   /// \returns True, if the expansion was successful, false otherwise
-  bool expandFP_TO_UINT(SDNode *N, SDValue &Result, SelectionDAG &DAG) const;
+  bool expandFP_TO_UINT(SDNode *N, SDValue &Result, SDValue &Chain, SelectionDAG &DAG) const;
 
   /// Expand UINT(i64) to double(f64) conversion
   /// \param N Node to expand
@@ -4068,8 +4098,8 @@ public:
   /// method accepts integers as its arguments.
   SDValue expandAddSubSat(SDNode *Node, SelectionDAG &DAG) const;
 
-  /// Method for building the DAG expansion of ISD::SMULFIX. This method accepts
-  /// integers as its arguments.
+  /// Method for building the DAG expansion of ISD::[U|S]MULFIX[SAT]. This
+  /// method accepts integers as its arguments.
   SDValue expandFixedPointMul(SDNode *Node, SelectionDAG &DAG) const;
 
   /// Method for building the DAG expansion of ISD::U(ADD|SUB)O. Expansion

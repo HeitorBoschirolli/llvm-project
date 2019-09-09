@@ -37,7 +37,7 @@
 #include "clang/StaticAnalyzer/Core/BugReporter/PathDiagnostic.h"
 #include "clang/StaticAnalyzer/Core/PathSensitive/CheckerContext.h"
 #include "clang/StaticAnalyzer/Core/PathSensitive/DynamicTypeInfo.h"
-#include "clang/StaticAnalyzer/Core/PathSensitive/DynamicTypeMap.h"
+#include "clang/StaticAnalyzer/Core/PathSensitive/DynamicType.h"
 #include "clang/StaticAnalyzer/Core/PathSensitive/MemRegion.h"
 #include "clang/StaticAnalyzer/Core/PathSensitive/ProgramState.h"
 #include "clang/StaticAnalyzer/Core/PathSensitive/ProgramState_Fwd.h"
@@ -368,7 +368,8 @@ bool CallEvent::isCalled(const CallDescription &CD) const {
 
   if (CD.Flags & CDF_MaybeBuiltin) {
     return CheckerContext::isCLibraryFunction(FD, CD.getFunctionName()) &&
-           (!CD.RequiredArgs || CD.RequiredArgs <= getNumArgs());
+           (!CD.RequiredArgs || CD.RequiredArgs <= getNumArgs()) &&
+           (!CD.RequiredParams || CD.RequiredParams <= parameters().size());
   }
 
   if (!CD.IsLookupDone) {
@@ -407,7 +408,8 @@ bool CallEvent::isCalled(const CallDescription &CD) const {
       return false;
   }
 
-  return (!CD.RequiredArgs || CD.RequiredArgs == getNumArgs());
+  return (!CD.RequiredArgs || CD.RequiredArgs == getNumArgs()) &&
+         (!CD.RequiredParams || CD.RequiredParams == parameters().size());
 }
 
 SVal CallEvent::getArgSVal(unsigned Index) const {

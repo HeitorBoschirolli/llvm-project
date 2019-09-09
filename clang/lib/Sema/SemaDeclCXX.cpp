@@ -1225,7 +1225,8 @@ static bool checkTupleLikeDecomposition(Sema &S,
     if (E.isInvalid())
       return true;
     RefVD->setInit(E.get());
-    RefVD->checkInitIsICE();
+    if (!E.get()->isValueDependent())
+      RefVD->checkInitIsICE();
 
     E = S.BuildDeclarationNameExpr(CXXScopeSpec(),
                                    DeclarationNameInfo(B->getDeclName(), Loc),
@@ -6232,6 +6233,22 @@ void Sema::CheckCompletedCXXClass(CXXRecordDecl *Record) {
       Diag(Record->getLocation(), diag::warn_abstract_final_class)
         << FA->isSpelledAsSealed();
       DiagnoseAbstractType(Record);
+    }
+  }
+
+  // Warn if the class has a final destructor but is not itself marked final.
+  if (!Record->hasAttr<FinalAttr>()) {
+    if (const CXXDestructorDecl *dtor = Record->getDestructor()) {
+      if (const FinalAttr *FA = dtor->getAttr<FinalAttr>()) {
+        Diag(FA->getLocation(), diag::warn_final_dtor_non_final_class)
+            << FA->isSpelledAsSealed()
+            << FixItHint::CreateInsertion(
+                   getLocForEndOfToken(Record->getLocation()),
+                   (FA->isSpelledAsSealed() ? " sealed" : " final"));
+        Diag(Record->getLocation(),
+             diag::note_final_dtor_non_final_class_silence)
+            << Context.getRecordType(Record) << FA->isSpelledAsSealed();
+      }
     }
   }
 

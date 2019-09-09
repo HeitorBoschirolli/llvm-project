@@ -518,7 +518,8 @@ MipsTargetLowering::MipsTargetLowering(const MipsTargetMachine &TM,
     setLibcallName(RTLIB::SRA_I128, nullptr);
   }
 
-  setMinFunctionAlignment(Subtarget.isGP64bit() ? 3 : 2);
+  setMinFunctionAlignment(Subtarget.isGP64bit() ? llvm::Align(8)
+                                                : llvm::Align(4));
 
   // The arguments on the stack are defined in terms of 4-byte slots on O32
   // and 8-byte slots on N32/N64.
@@ -1967,10 +1968,10 @@ SDValue MipsTargetLowering::lowerGlobalAddress(SDValue Op,
       // %gp_rel relocation
       return getAddrGPRel(N, SDLoc(N), Ty, DAG, ABI.IsN64());
 
-                                 // %hi/%lo relocation
+                                // %hi/%lo relocation
     return Subtarget.hasSym32() ? getAddrNonPIC(N, SDLoc(N), Ty, DAG)
-                                 // %highest/%higher/%hi/%lo relocation
-                                 : getAddrNonPICSym64(N, SDLoc(N), Ty, DAG);
+                                // %highest/%higher/%hi/%lo relocation
+                                : getAddrNonPICSym64(N, SDLoc(N), Ty, DAG);
   }
 
   // Every other architecture would use shouldAssumeDSOLocal in here, but

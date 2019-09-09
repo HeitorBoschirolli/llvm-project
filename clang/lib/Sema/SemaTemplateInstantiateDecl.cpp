@@ -470,14 +470,12 @@ void Sema::InstantiateAttrs(const MultiLevelTemplateArgumentList &TemplateArgs,
       continue;
     }
 
-    const AssumeAlignedAttr *AssumeAligned = dyn_cast<AssumeAlignedAttr>(TmplAttr);
-    if (AssumeAligned) {
+    if (const auto *AssumeAligned = dyn_cast<AssumeAlignedAttr>(TmplAttr)) {
       instantiateDependentAssumeAlignedAttr(*this, TemplateArgs, AssumeAligned, New);
       continue;
     }
 
-    const AlignValueAttr *AlignValue = dyn_cast<AlignValueAttr>(TmplAttr);
-    if (AlignValue) {
+    if (const auto *AlignValue = dyn_cast<AlignValueAttr>(TmplAttr)) {
       instantiateDependentAlignValueAttr(*this, TemplateArgs, AlignValue, New);
       continue;
     }
@@ -500,14 +498,14 @@ void Sema::InstantiateAttrs(const MultiLevelTemplateArgumentList &TemplateArgs,
       continue;
     }
 
-    if (const CUDALaunchBoundsAttr *CUDALaunchBounds =
+    if (const auto *CUDALaunchBounds =
             dyn_cast<CUDALaunchBoundsAttr>(TmplAttr)) {
       instantiateDependentCUDALaunchBoundsAttr(*this, TemplateArgs,
                                                *CUDALaunchBounds, New);
       continue;
     }
 
-    if (const ModeAttr *Mode = dyn_cast<ModeAttr>(TmplAttr)) {
+    if (const auto *Mode = dyn_cast<ModeAttr>(TmplAttr)) {
       instantiateDependentModeAttr(*this, TemplateArgs, *Mode, New);
       continue;
     }
@@ -517,13 +515,13 @@ void Sema::InstantiateAttrs(const MultiLevelTemplateArgumentList &TemplateArgs,
       continue;
     }
 
-    if (const AMDGPUFlatWorkGroupSizeAttr *AMDGPUFlatWorkGroupSize =
+    if (const auto *AMDGPUFlatWorkGroupSize =
             dyn_cast<AMDGPUFlatWorkGroupSizeAttr>(TmplAttr)) {
       instantiateDependentAMDGPUFlatWorkGroupSizeAttr(
           *this, TemplateArgs, *AMDGPUFlatWorkGroupSize, New);
     }
 
-    if (const AMDGPUWavesPerEUAttr *AMDGPUFlatWorkGroupSize =
+    if (const auto *AMDGPUFlatWorkGroupSize =
             dyn_cast<AMDGPUWavesPerEUAttr>(TmplAttr)) {
       instantiateDependentAMDGPUWavesPerEUAttr(*this, TemplateArgs,
                                                *AMDGPUFlatWorkGroupSize, New);
@@ -537,7 +535,7 @@ void Sema::InstantiateAttrs(const MultiLevelTemplateArgumentList &TemplateArgs,
       }
     }
 
-    if (auto ABIAttr = dyn_cast<ParameterABIAttr>(TmplAttr)) {
+    if (const auto *ABIAttr = dyn_cast<ParameterABIAttr>(TmplAttr)) {
       AddParameterABIAttr(ABIAttr->getRange(), New, ABIAttr->getABI(),
                           ABIAttr->getSpellingListIndex());
       continue;
@@ -549,6 +547,18 @@ void Sema::InstantiateAttrs(const MultiLevelTemplateArgumentList &TemplateArgs,
                        TmplAttr->getSpellingListIndex(),
                        attrToRetainOwnershipKind(TmplAttr),
                        /*template instantiation=*/true);
+      continue;
+    }
+
+    if (auto *A = dyn_cast<PointerAttr>(TmplAttr)) {
+      if (!New->hasAttr<PointerAttr>())
+        New->addAttr(A->clone(Context));
+      continue;
+    }
+
+    if (auto *A = dyn_cast<OwnerAttr>(TmplAttr)) {
+      if (!New->hasAttr<OwnerAttr>())
+        New->addAttr(A->clone(Context));
       continue;
     }
 
@@ -710,6 +720,9 @@ Decl *TemplateDeclInstantiator::InstantiateTypedefNameDecl(TypedefNameDecl *D,
   }
 
   SemaRef.InstantiateAttrs(TemplateArgs, D, Typedef);
+
+  if (D->getUnderlyingType()->getAs<DependentNameType>())
+    SemaRef.inferGslPointerAttribute(Typedef);
 
   Typedef->setAccess(D->getAccess());
 
@@ -2339,6 +2352,7 @@ Decl *TemplateDeclInstantiator::VisitTemplateTypeParmDecl(
       D->getDepth() - TemplateArgs.getNumSubstitutedLevels(), D->getIndex(),
       D->getIdentifier(), D->wasDeclaredWithTypename(), D->isParameterPack());
   Inst->setAccess(AS_public);
+  Inst->setImplicit(D->isImplicit());
 
   if (D->hasDefaultArgument() && !D->defaultArgumentWasInherited()) {
     TypeSourceInfo *InstantiatedDefaultArg =
@@ -2485,6 +2499,7 @@ Decl *TemplateDeclInstantiator::VisitNonTypeTemplateParmDecl(
         D->getPosition(), D->getIdentifier(), T, D->isParameterPack(), DI);
 
   Param->setAccess(AS_public);
+  Param->setImplicit(D->isImplicit());
   if (Invalid)
     Param->setInvalidDecl();
 
@@ -2628,6 +2643,7 @@ TemplateDeclInstantiator::VisitTemplateTemplateParmDecl(
                               D->getDefaultArgument().getTemplateNameLoc()));
   }
   Param->setAccess(AS_public);
+  Param->setImplicit(D->isImplicit());
 
   // Introduce this template parameter's instantiation into the instantiation
   // scope.
@@ -3415,7 +3431,11 @@ Decl *Sema::SubstDecl(Decl *D, DeclContext *Owner,
   if (D->isInvalidDecl())
     return nullptr;
 
-  return Instantiator.Visit(D);
+  Decl *SubstD;
+  runWithSufficientStackSpace(D->getLocation(), [&] {
+    SubstD = Instantiator.Visit(D);
+  });
+  return SubstD;
 }
 
 /// Instantiates a nested template parameter list in the current

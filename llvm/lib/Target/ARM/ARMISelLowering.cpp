@@ -245,7 +245,7 @@ void ARMTargetLowering::addMVEVectorTypes(bool HasMVEFP) {
   const MVT IntTypes[] = { MVT::v16i8, MVT::v8i16, MVT::v4i32 };
 
   for (auto VT : IntTypes) {
-    addRegisterClass(VT, &ARM::QPRRegClass);
+    addRegisterClass(VT, &ARM::MQPRRegClass);
     setOperationAction(ISD::VECTOR_SHUFFLE, VT, Custom);
     setOperationAction(ISD::INSERT_VECTOR_ELT, VT, Custom);
     setOperationAction(ISD::EXTRACT_VECTOR_ELT, VT, Custom);
@@ -287,7 +287,7 @@ void ARMTargetLowering::addMVEVectorTypes(bool HasMVEFP) {
 
   const MVT FloatTypes[] = { MVT::v8f16, MVT::v4f32 };
   for (auto VT : FloatTypes) {
-    addRegisterClass(VT, &ARM::QPRRegClass);
+    addRegisterClass(VT, &ARM::MQPRRegClass);
     if (!HasMVEFP)
       setAllExpand(VT);
 
@@ -334,7 +334,7 @@ void ARMTargetLowering::addMVEVectorTypes(bool HasMVEFP) {
   // vector types is inhibited at integer-only level.
   const MVT LongTypes[] = { MVT::v2i64, MVT::v2f64 };
   for (auto VT : LongTypes) {
-    addRegisterClass(VT, &ARM::QPRRegClass);
+    addRegisterClass(VT, &ARM::MQPRRegClass);
     setAllExpand(VT);
     setOperationAction(ISD::INSERT_VECTOR_ELT, VT, Custom);
     setOperationAction(ISD::EXTRACT_VECTOR_ELT, VT, Custom);
@@ -1419,9 +1419,11 @@ ARMTargetLowering::ARMTargetLowering(const TargetMachine &TM,
   // Prefer likely predicted branches to selects on out-of-order cores.
   PredictableSelectIsExpensive = Subtarget->getSchedModel().isOutOfOrder();
 
-  setPrefLoopAlignment(Subtarget->getPrefLoopAlignment());
+  setPrefLoopAlignment(
+      llvm::Align(1ULL << Subtarget->getPrefLoopLogAlignment()));
 
-  setMinFunctionAlignment(Subtarget->isThumb() ? 1 : 2);
+  setMinFunctionAlignment(Subtarget->isThumb() ? llvm::Align(2)
+                                               : llvm::Align(4));
 
   if (Subtarget->isThumb() || Subtarget->isThumb2())
     setTargetDAGCombine(ISD::ABS);
@@ -1634,6 +1636,9 @@ const char *ARMTargetLowering::getTargetNodeName(unsigned Opcode) const {
   case ARMISD::WLS:           return "ARMISD::WLS";
   case ARMISD::LE:            return "ARMISD::LE";
   case ARMISD::LOOP_DEC:      return "ARMISD::LOOP_DEC";
+  case ARMISD::CSINV:         return "ARMISD::CSINV";
+  case ARMISD::CSNEG:         return "ARMISD::CSNEG";
+  case ARMISD::CSINC:         return "ARMISD::CSINC";
   }
   return nullptr;
 }
@@ -4815,10 +4820,62 @@ SDValue ARMTargetLowering::LowerSELECT_CC(SDValue Op, SelectionDAG &DAG) const {
   ISD::CondCode CC = cast<CondCodeSDNode>(Op.getOperand(4))->get();
   SDValue TrueVal = Op.getOperand(2);
   SDValue FalseVal = Op.getOperand(3);
+  ConstantSDNode *CFVal = dyn_cast<ConstantSDNode>(FalseVal);
+  ConstantSDNode *CTVal = dyn_cast<ConstantSDNode>(TrueVal);
+
+  if (Subtarget->hasV8_1MMainlineOps() && CFVal && CTVal &&
+      LHS.getValueType() == MVT::i32 && RHS.getValueType() == MVT::i32) {
+    unsigned TVal = CTVal->getZExtValue();
+    unsigned FVal = CFVal->getZExtValue();
+    unsigned Opcode = 0;
+
+    if (TVal == ~FVal) {
+      Opcode = ARMISD::CSINV;
+    } else if (TVal == ~FVal + 1) {
+      Opcode = ARMISD::CSNEG;
+    } else if (TVal + 1 == FVal) {
+      Opcode = ARMISD::CSINC;
+    } else if (TVal == FVal + 1) {
+      Opcode = ARMISD::CSINC;
+      std::swap(TrueVal, FalseVal);
+      std::swap(TVal, FVal);
+      CC = ISD::getSetCCInverse(CC, true);
+    }
+
+    if (Opcode) {
+      // If one of the constants is cheaper than another, materialise the
+      // cheaper one and let the csel generate the other.
+      if (Opcode != ARMISD::CSINC &&
+          HasLowerConstantMaterializationCost(FVal, TVal, Subtarget)) {
+        std::swap(TrueVal, FalseVal);
+        std::swap(TVal, FVal);
+        CC = ISD::getSetCCInverse(CC, true);
+      }
+
+      // Attempt to use ZR checking TVal is 0, possibly inverting the condition
+      // to get there. CSINC not is invertable like the other two (~(~a) == a,
+      // -(-a) == a, but (a+1)+1 != a).
+      if (FVal == 0 && Opcode != ARMISD::CSINC) {
+        std::swap(TrueVal, FalseVal);
+        std::swap(TVal, FVal);
+        CC = ISD::getSetCCInverse(CC, true);
+      }
+      if (TVal == 0)
+        TrueVal = DAG.getRegister(ARM::ZR, MVT::i32);
+
+      // Drops F's value because we can get it by inverting/negating TVal.
+      FalseVal = TrueVal;
+
+      SDValue ARMcc;
+      SDValue Cmp = getARMCmp(LHS, RHS, CC, ARMcc, DAG, dl);
+      EVT VT = TrueVal.getValueType();
+      return DAG.getNode(Opcode, dl, VT, TrueVal, FalseVal, ARMcc, Cmp);
+    }
+  }
 
   if (isUnsupportedFloatingType(LHS.getValueType())) {
     DAG.getTargetLoweringInfo().softenSetCCOperands(
-        DAG, LHS.getValueType(), LHS, RHS, CC, dl);
+        DAG, LHS.getValueType(), LHS, RHS, CC, dl, LHS, RHS);
 
     // If softenSetCCOperands only returned one value, we should compare it to
     // zero.
@@ -5062,7 +5119,7 @@ SDValue ARMTargetLowering::LowerBR_CC(SDValue Op, SelectionDAG &DAG) const {
 
   if (isUnsupportedFloatingType(LHS.getValueType())) {
     DAG.getTargetLoweringInfo().softenSetCCOperands(
-        DAG, LHS.getValueType(), LHS, RHS, CC, dl);
+        DAG, LHS.getValueType(), LHS, RHS, CC, dl, LHS, RHS);
 
     // If softenSetCCOperands only returned one value, we should compare it to
     // zero.
@@ -5215,8 +5272,9 @@ SDValue ARMTargetLowering::LowerFP_TO_INT(SDValue Op, SelectionDAG &DAG) const {
     else
       LC = RTLIB::getFPTOUINT(Op.getOperand(0).getValueType(),
                               Op.getValueType());
+    MakeLibCallOptions CallOptions;
     return makeLibCall(DAG, LC, Op.getValueType(), Op.getOperand(0),
-                       /*isSigned*/ false, SDLoc(Op)).first;
+                       CallOptions, SDLoc(Op)).first;
   }
 
   return Op;
@@ -5279,8 +5337,9 @@ SDValue ARMTargetLowering::LowerINT_TO_FP(SDValue Op, SelectionDAG &DAG) const {
     else
       LC = RTLIB::getUINTTOFP(Op.getOperand(0).getValueType(),
                               Op.getValueType());
+    MakeLibCallOptions CallOptions;
     return makeLibCall(DAG, LC, Op.getValueType(), Op.getOperand(0),
-                       /*isSigned*/ false, SDLoc(Op)).first;
+                       CallOptions, SDLoc(Op)).first;
   }
 
   return Op;
@@ -5936,14 +5995,15 @@ static SDValue Expand64BitShift(SDNode *N, SelectionDAG &DAG,
     unsigned ShPartsOpc = ARMISD::LSLL;
     ConstantSDNode *Con = dyn_cast<ConstantSDNode>(ShAmt);
 
-    // If the shift amount is greater than 32 then do the default optimisation
-    if (Con && Con->getZExtValue() > 32)
+    // If the shift amount is greater than 32 or has a greater bitwidth than 64
+    // then do the default optimisation
+    if (ShAmt->getValueType(0).getSizeInBits() > 64 ||
+        (Con && Con->getZExtValue() >= 32))
       return SDValue();
 
-    // Extract the lower 32 bits of the shift amount if it's an i64
-    if (ShAmt->getValueType(0) == MVT::i64)
-      ShAmt = DAG.getNode(ISD::EXTRACT_ELEMENT, dl, MVT::i32, ShAmt,
-                          DAG.getConstant(0, dl, MVT::i32));
+    // Extract the lower 32 bits of the shift amount if it's not an i32
+    if (ShAmt->getValueType(0) != MVT::i32)
+      ShAmt = DAG.getZExtOrTrunc(ShAmt, dl, MVT::i32);
 
     if (ShOpc == ISD::SRL) {
       if (!Con)
@@ -7320,9 +7380,6 @@ SDValue ARMTargetLowering::ReconstructShuffle(SDValue Op,
       LaneMask[j] = ExtractBase + j;
   }
 
-  // Final check before we try to produce nonsense...
-  if (!isShuffleMaskLegal(Mask, ShuffleVT))
-    return SDValue();
 
   // We can't handle more than two sources. This should have already
   // been checked before this point.
@@ -7332,8 +7389,10 @@ SDValue ARMTargetLowering::ReconstructShuffle(SDValue Op,
   for (unsigned i = 0; i < Sources.size(); ++i)
     ShuffleOps[i] = Sources[i].ShuffleVec;
 
-  SDValue Shuffle = DAG.getVectorShuffle(ShuffleVT, dl, ShuffleOps[0],
-                                         ShuffleOps[1], Mask);
+  SDValue Shuffle = buildLegalVectorShuffle(ShuffleVT, dl, ShuffleOps[0],
+                                            ShuffleOps[1], Mask, DAG);
+  if (!Shuffle)
+    return SDValue();
   return DAG.getNode(ISD::BITCAST, dl, VT, Shuffle);
 }
 
@@ -14281,22 +14340,60 @@ static bool areExtractExts(Value *Ext1, Value *Ext2) {
 /// sext/zext can be folded into vsubl.
 bool ARMTargetLowering::shouldSinkOperands(Instruction *I,
                                            SmallVectorImpl<Use *> &Ops) const {
-  if (!Subtarget->hasNEON() || !I->getType()->isVectorTy())
+  if (!I->getType()->isVectorTy())
     return false;
 
-  switch (I->getOpcode()) {
-  case Instruction::Sub:
-  case Instruction::Add: {
-    if (!areExtractExts(I->getOperand(0), I->getOperand(1)))
+  if (Subtarget->hasNEON()) {
+    switch (I->getOpcode()) {
+    case Instruction::Sub:
+    case Instruction::Add: {
+      if (!areExtractExts(I->getOperand(0), I->getOperand(1)))
+        return false;
+      Ops.push_back(&I->getOperandUse(0));
+      Ops.push_back(&I->getOperandUse(1));
+      return true;
+    }
+    default:
       return false;
-    Ops.push_back(&I->getOperandUse(0));
-    Ops.push_back(&I->getOperandUse(1));
-    return true;
+    }
   }
-  default:
+
+  if (!Subtarget->hasMVEIntegerOps())
+    return false;
+
+  auto IsSinker = [](Instruction *I, int Operand) {
+    switch (I->getOpcode()) {
+    case Instruction::Add:
+    case Instruction::Mul:
+      return true;
+    case Instruction::Sub:
+      return Operand == 1;
+    default:
+      return false;
+    }
+  };
+
+  int Op = 0;
+  if (!isa<ShuffleVectorInst>(I->getOperand(Op)))
+    Op = 1;
+  if (!IsSinker(I, Op))
+    return false;
+  if (!match(I->getOperand(Op),
+             m_ShuffleVector(m_InsertElement(m_Undef(), m_Value(), m_ZeroInt()),
+                             m_Undef(), m_Zero()))) {
     return false;
   }
-  return false;
+  Instruction *Shuffle = cast<Instruction>(I->getOperand(Op));
+  // All uses of the shuffle should be sunk to avoid duplicating it across gpr
+  // and vector registers
+  for (Use &U : Shuffle->uses()) {
+    Instruction *Insn = cast<Instruction>(U.getUser());
+    if (!IsSinker(Insn, U.getOperandNo()))
+      return false;
+  }
+  Ops.push_back(&Shuffle->getOperandUse(0));
+  Ops.push_back(&I->getOperandUse(Op));
+  return true;
 }
 
 bool ARMTargetLowering::isVectorLoadExtDesirable(SDValue ExtVal) const {
@@ -15266,7 +15363,7 @@ void ARMTargetLowering::LowerAsmOperandForConstraint(SDValue Op,
       case 'j':
         // Constant suitable for movw, must be between 0 and
         // 65535.
-        if (Subtarget->hasV6T2Ops())
+        if (Subtarget->hasV6T2Ops() || (Subtarget->hasV8MBaselineOps()))
           if (CVal >= 0 && CVal <= 65535)
             break;
         return;
@@ -15374,7 +15471,7 @@ void ARMTargetLowering::LowerAsmOperandForConstraint(SDValue Op,
         return;
 
       case 'N':
-        if (Subtarget->isThumb()) {  // FIXME thumb2
+        if (Subtarget->isThumb1Only()) {
           // This must be a constant between 0 and 31, for shift amounts.
           if (CVal >= 0 && CVal <= 31)
             break;
@@ -15382,7 +15479,7 @@ void ARMTargetLowering::LowerAsmOperandForConstraint(SDValue Op,
         return;
 
       case 'O':
-        if (Subtarget->isThumb()) {  // FIXME thumb2
+        if (Subtarget->isThumb1Only()) {
           // This must be a multiple of 4 between -508 and 508, for
           // ADD/SUB sp = sp + immediate.
           if ((CVal >= -508 && CVal <= 508) && ((CVal & 3) == 0))
@@ -15605,6 +15702,7 @@ SDValue ARMTargetLowering::LowerFP_EXTEND(SDValue Op, SelectionDAG &DAG) const {
   // without FP16. So we must do a function call.
   SDLoc Loc(Op);
   RTLIB::Libcall LC;
+  MakeLibCallOptions CallOptions;
   if (SrcSz == 16) {
     // Instruction from 16 -> 32
     if (Subtarget->hasFP16())
@@ -15615,7 +15713,7 @@ SDValue ARMTargetLowering::LowerFP_EXTEND(SDValue Op, SelectionDAG &DAG) const {
       assert(LC != RTLIB::UNKNOWN_LIBCALL &&
              "Unexpected type for custom-lowering FP_EXTEND");
       SrcVal =
-        makeLibCall(DAG, LC, MVT::f32, SrcVal, /*isSigned*/ false, Loc).first;
+        makeLibCall(DAG, LC, MVT::f32, SrcVal, CallOptions, Loc).first;
     }
   }
 
@@ -15628,7 +15726,7 @@ SDValue ARMTargetLowering::LowerFP_EXTEND(SDValue Op, SelectionDAG &DAG) const {
   LC = RTLIB::getFPEXT(MVT::f32, MVT::f64);
   assert(LC != RTLIB::UNKNOWN_LIBCALL &&
          "Unexpected type for custom-lowering FP_EXTEND");
-  return makeLibCall(DAG, LC, MVT::f64, SrcVal, /*isSigned*/ false, Loc).first;
+  return makeLibCall(DAG, LC, MVT::f64, SrcVal, CallOptions, Loc).first;
 }
 
 SDValue ARMTargetLowering::LowerFP_ROUND(SDValue Op, SelectionDAG &DAG) const {
@@ -15654,7 +15752,8 @@ SDValue ARMTargetLowering::LowerFP_ROUND(SDValue Op, SelectionDAG &DAG) const {
   RTLIB::Libcall LC = RTLIB::getFPROUND(SrcVT, DstVT);
   assert(LC != RTLIB::UNKNOWN_LIBCALL &&
          "Unexpected type for custom-lowering FP_ROUND");
-  return makeLibCall(DAG, LC, DstVT, SrcVal, /*isSigned*/ false, Loc).first;
+  MakeLibCallOptions CallOptions;
+  return makeLibCall(DAG, LC, DstVT, SrcVal, CallOptions, Loc).first;
 }
 
 void ARMTargetLowering::lowerABS(SDNode *N, SmallVectorImpl<SDValue> &Results,
