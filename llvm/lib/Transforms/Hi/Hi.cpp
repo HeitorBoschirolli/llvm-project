@@ -7,23 +7,21 @@
 using namespace llvm;
 
 namespace {
-    struct Hi : public CallGraphSCCPass {
+    struct Hi : public ModulePass {
         static char ID;
-        Hi() : CallGraphSCCPass(ID) {}
+        Hi() : ModulePass(ID) {}
 
-        bool runOnSCC(CallGraphSCC &SCC) override {
-            errs() << "Hi: ";
-            errs().write_escaped(std::to_string(SCC.size())) << '\n';
-            errs() << "=============================" << '\n';
+        bool runOnModule(Module &M) override {
+            errs() << "Hi: " << '\n';
 
-            int counter = 0;
-            for (CallGraphNode *Node : SCC) {
-                errs() << counter++ << '\n';
-                Function *F = Node->getFunction();
-                // std::string s = F->getName();
-                // errs().write_escaped(F->getName()) << '\n';
+            auto ftype = M.getTypeByName("another_function");
+            for (auto &F : M) {
+                errs() << F.getName() << '\n';
             }
-            return false;
+
+            M.getOrInsertFunction("the_new_function", ftype);
+
+            return true;
         }
     };
 }
